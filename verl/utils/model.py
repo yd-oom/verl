@@ -588,6 +588,146 @@ def get_parallel_gptmodel_from_config(
     return parallel_model
 
 
+class ValueOnlyVLModelWrapper(torch.nn.Module):
+    """
+    A memory-efficient wrapper for VL models that only computes value head output.
+    
+    Unlike AutoModelForCausalLMWithValueHead which computes full LM logits (vocab_size dim),
+    this wrapper completely skips the LM head computation, saving ~14GB memory for models
+    with large vocabularies like Qwen3-VL (152k vocab).
+    
+    Memory savings calculation:
+    - Original: 24576 tokens × 151643 vocab × 4 bytes ≈ 13.88 GB
+    - With this wrapper: 24576 tokens × 1 × 4 bytes ≈ 0.1 MB
+    
+    This is designed for GAD (Generative Adversarial Distillation) discriminator training
+    where only scalar value predictions are needed, not full vocabulary logits.
+    """
+    
+    def __init__(self, pretrained_model: torch.nn.Module, hidden_size: int):
+        super().__init__()
+        self.pretrained_model = pretrained_model
+        self.config = pretrained_model.config
+        
+        # Simple value head: hidden_size -> 1
+        # This replaces the expensive LM head (hidden_size -> vocab_size)
+        self.v_head = torch.nn.Linear(hidden_size, 1, bias=False)
+        
+        # Initialize with small weights for stable training
+        self.v_head.weight.data.normal_(mean=0.0, std=0.02)
+        
+        # Store _no_split_modules for FSDP compatibility
+        self._no_split_modules = getattr(pretrained_model, "_no_split_modules", [])
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """
+        Forward pass that only computes value head output, skipping LM head entirely.
+        
+        Returns:
+            tuple: (None, None, values)
+                - None: placeholder for lm_logits (not computed to save memory)
+                - None: placeholder for past_key_values
+                - values: tensor of shape (batch, seq_len) or (1, total_nnz) for remove_padding
+        """
+        # Build kwargs for the base model
+        model_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "use_cache": False,
+            "output_hidden_states": True,
+            "return_dict": True,
+        }
+        
+        # Add multimodal inputs if present
+        if pixel_values is not None:
+            model_kwargs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            model_kwargs["image_grid_thw"] = image_grid_thw
+        if pixel_values_videos is not None:
+            model_kwargs["pixel_values_videos"] = pixel_values_videos
+        if video_grid_thw is not None:
+            model_kwargs["video_grid_thw"] = video_grid_thw
+        
+        # Add any additional kwargs (e.g., rope_deltas for Qwen2VL)
+        for key, value in kwargs.items():
+            if key not in model_kwargs and value is not None:
+                model_kwargs[key] = value
+        
+        # Get hidden states from the base model
+        # We access the underlying model to get hidden states without computing LM logits
+        if hasattr(self.pretrained_model, "model"):
+            # For models like Qwen2VLForConditionalGeneration that have a .model attribute
+            base_model = self.pretrained_model.model
+            outputs = base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pixel_values=pixel_values if pixel_values is not None else None,
+                image_grid_thw=image_grid_thw if image_grid_thw is not None else None,
+                pixel_values_videos=pixel_values_videos if pixel_values_videos is not None else None,
+                video_grid_thw=video_grid_thw if video_grid_thw is not None else None,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+                **{k: v for k, v in kwargs.items() if k not in ["use_cache", "output_hidden_states", "return_dict"]},
+            )
+            hidden_states = outputs.last_hidden_state
+        else:
+            # Fallback: call the full model but only use hidden states
+            outputs = self.pretrained_model(**model_kwargs)
+            hidden_states = outputs.hidden_states[-1] if outputs.hidden_states else outputs.last_hidden_state
+        
+        # Compute value head output: (batch, seq_len, hidden_size) -> (batch, seq_len, 1) -> (batch, seq_len)
+        values = self.v_head(hidden_states).squeeze(-1)
+        
+        # Return format compatible with AutoModelForCausalLMWithValueHead:
+        # (lm_logits, past_key_values, values)
+        # Note: values shape is (batch, seq_len) to match TRL's behavior
+        return (None, None, values)
+    
+    def tie_weights(self):
+        """Tie weights if the base model supports it."""
+        if hasattr(self.pretrained_model, "tie_weights"):
+            self.pretrained_model.tie_weights()
+    
+    def get_input_embeddings(self):
+        """Get input embeddings from the base model."""
+        if hasattr(self.pretrained_model, "get_input_embeddings"):
+            return self.pretrained_model.get_input_embeddings()
+        return None
+    
+    def get_output_embeddings(self):
+        """Return None since we don't use LM head."""
+        return None
+    
+    def can_generate(self):
+        """This model cannot generate text."""
+        return False
+    
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing on the base model."""
+        if hasattr(self.pretrained_model, "gradient_checkpointing_enable"):
+            self.pretrained_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+            )
+    
+    def enable_input_require_grads(self):
+        """Enable input gradients for LoRA training."""
+        if hasattr(self.pretrained_model, "enable_input_require_grads"):
+            self.pretrained_model.enable_input_require_grads()
+
+
 def patch_valuehead_model(model) -> None:
     from types import MethodType
 
@@ -618,9 +758,25 @@ def patch_valuehead_model(model) -> None:
     model._no_split_modules = getattr(model.pretrained_model, "_no_split_modules", [])
 
 
-def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
+def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code, use_value_only_wrapper=True):
+    """
+    Load a model with value head for critic/discriminator training.
+    
+    Args:
+        local_path: Path to the model checkpoint
+        torch_dtype: Data type for model parameters
+        model_config: Model configuration object
+        trust_remote_code: Whether to trust remote code
+        use_value_only_wrapper: If True and model is a VL model, use ValueOnlyVLModelWrapper
+                               to avoid computing expensive LM head logits. This saves ~14GB
+                               memory for models with large vocabularies. Default: True.
+    
+    Returns:
+        Model with value head capability
+    """
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
 
+    # First, try to load as TokenClassification model (most memory efficient)
     try:
         model = AutoModelForTokenClassification.from_pretrained(
             pretrained_model_name_or_path=local_path,
@@ -631,19 +787,54 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
         )
         return model
     except BaseException as e:
-        if not is_trl_available():
-            raise RuntimeError(
-                f"model({local_path}) is not a value head model, please install trl to make it valid"
-            ) from e
-
-    assert is_trl_available()
+        # TokenClassification not supported for this model type
+        pass
+    
+    # Check if this is a VL (Vision-Language) model
+    is_vl_model = type(model_config) in AutoModelForVision2Seq._model_mapping.keys()
+    
+    # For VL models, use ValueOnlyVLModelWrapper to save memory
+    if is_vl_model and use_value_only_wrapper:
+        print(f"[load_valuehead_model] Using ValueOnlyVLModelWrapper for VL model (saves ~14GB memory)")
+        
+        ori_model = AutoModelForVision2Seq.from_pretrained(
+            pretrained_model_name_or_path=local_path,
+            torch_dtype=torch_dtype,
+            config=model_config,
+            attn_implementation="flash_attention_2",
+            trust_remote_code=trust_remote_code,
+        )
+        
+        # Get hidden size from config
+        hidden_size = getattr(model_config, "hidden_size", None)
+        if hidden_size is None:
+            # Some VL models store hidden_size in text_config
+            text_config = getattr(model_config, "text_config", None)
+            if text_config is not None:
+                hidden_size = getattr(text_config, "hidden_size", None)
+        
+        if hidden_size is None:
+            raise ValueError(
+                f"Cannot determine hidden_size from model config. "
+                f"Config type: {type(model_config).__name__}"
+            )
+        
+        model = ValueOnlyVLModelWrapper(ori_model, hidden_size)
+        return model
+    
+    # Fallback to AutoModelForCausalLMWithValueHead (original behavior)
+    if not is_trl_available():
+        raise RuntimeError(
+            f"model({local_path}) is not a value head model, please install trl to make it valid"
+        )
 
     from trl import AutoModelForCausalLMWithValueHead
 
-    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+    if is_vl_model:
         module_class = AutoModelForVision2Seq
     else:
         module_class = AutoModelForCausalLM
+    
     ori_model = module_class.from_pretrained(
         pretrained_model_name_or_path=local_path,
         torch_dtype=torch_dtype,
