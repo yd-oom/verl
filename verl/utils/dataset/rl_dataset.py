@@ -318,7 +318,7 @@ class RLHFDataset(Dataset):
                     if isinstance(image, Image.Image):
                         image = image.convert("RGB")
                     elif isinstance(image, dict) and "bytes" in image:
-                        image["image"] = Image.open(BytesIO(image["bytes"]))
+                        image = Image.open(BytesIO(image["bytes"])).convert("RGB")
                     content_list.append({"type": "image", "image": image})
                     image_offset += 1
                 elif segment == "<video>":
@@ -341,6 +341,14 @@ class RLHFDataset(Dataset):
         # TODO(wuxibin): We still need a dummy tensor to make sure DataProto.batch is not empty.
         # Remove this after deprecate DataProto by TensorDict.
         row_dict["dummy_tensor"] = torch.tensor([0], dtype=torch.uint8)
+
+        # GAD: Extract teacher_response if present
+        # Teacher response will be tokenized in AgentLoop like other text fields
+        # Keep it as string here for now, will be processed later in the pipeline
+        teacher_response = row_dict.get("teacher_response", None)
+        if teacher_response is not None:
+            # Store as string, will be tokenized later in rollout worker
+            row_dict["teacher_response"] = teacher_response
 
         # add index for each prompt
         if "extra_info" not in row_dict or row_dict["extra_info"] is None:

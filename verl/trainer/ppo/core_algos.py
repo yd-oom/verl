@@ -2204,3 +2204,38 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+def compute_discriminator_loss(
+    student_vpreds: torch.Tensor,
+    teacher_vpreds: torch.Tensor,
+    response_mask: torch.Tensor,
+    teacher_response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute discriminator loss for GAD (Generative Adversarial Distillation).
+    
+    The discriminator learns to distinguish between teacher and student responses
+    using Bradley-Terry loss. The goal is to make teacher_reward > student_reward.
+    
+    Args:
+        student_vpreds: Value predictions for student responses, shape (batch_size, response_length).
+        teacher_vpreds: Value predictions for teacher responses, shape (batch_size, teacher_response_length).
+        response_mask: Mask for valid tokens in student responses, shape (batch_size, response_length).
+        teacher_response_mask: Mask for valid tokens in teacher responses, shape (batch_size, teacher_response_length).
+    
+    Returns:
+        d_loss: Discriminator loss scalar.
+        
+    Reference:
+        GAD paper: "Black-Box On-Policy Distillation of Large Language Models"
+        Loss formula: -log(sigmoid(teacher_reward - student_reward))
+    """
+    # Aggregate token-level value predictions to sequence-level rewards
+    teacher_reward = torch.sum(teacher_vpreds * teacher_response_mask, dim=-1)  # (batch_size,)
+    student_reward = torch.sum(student_vpreds * response_mask, dim=-1)  # (batch_size,)
+    
+    # Bradley-Terry loss: maximize log(sigmoid(teacher_reward - student_reward))
+    # Equivalently, minimize -log(sigmoid(teacher_reward - student_reward))
+    d_loss = -torch.nn.functional.logsigmoid(teacher_reward - student_reward).mean()
+    
+    return d_loss
