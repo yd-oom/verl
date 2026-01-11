@@ -47,7 +47,6 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
-    compute_variance_proxy_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -257,17 +256,6 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
-        # Add sum_pi_squared for Optimal Token Baseline
-        if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
-            # Check if sum_pi_squared is available
-            assert "sum_pi_squared" in data.batch, (
-                "Step-dependent optimal baseline requires sum_pi_squared from actor. "
-                "Please set actor.calculate_sum_pi_squared=True in config."
-            )
-            adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
-            # Get pre-computed rollout IS weights if available
-            rollout_is_weights = data.batch.get("rollout_is_weights", None)
-            adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
@@ -353,17 +341,16 @@ class RayPPOTrainer:
         )
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
-        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-        if lora_rank <= 0:
-            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-        self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        self.ref_in_actor = (
+            config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+            or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        )
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
-        self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -439,6 +426,18 @@ class RayPPOTrainer:
 
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
+
+        # Detect GAD mode by checking if training data contains teacher_input_ids
+        # GAD (Generative Adversarial Distillation) uses critic values as reward instead of ground_truth
+        self.is_gad_mode = False
+        try:
+            first_sample = self.train_dataset[0]
+            if isinstance(first_sample, dict):
+                self.is_gad_mode = "teacher_input_ids" in first_sample or "teacher_response" in first_sample
+            if self.is_gad_mode:
+                print("GAD mode detected: using critic values as reward, skipping naive reward calculation")
+        except Exception as e:
+            print(f"Warning: Could not detect GAD mode from training data: {e}")
 
         try:
             OmegaConf.set_struct(self.config, True)
@@ -617,7 +616,7 @@ class RayPPOTrainer:
 
         return gen_batch
 
-    def _validate(self, merged: bool = False):
+    def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -696,8 +695,7 @@ class RayPPOTrainer:
 
             # evaluate using reward_function
             # GAD mode: skip reward calculation during validation as reward comes from critic
-            is_gad_mode = "teacher_input_ids" in test_batch.batch
-            if is_gad_mode:
+            if self.is_gad_mode:
                 # In GAD mode, we don't have ground_truth for naive reward calculation
                 # Return zero rewards for validation metrics
                 reward_tensor = torch.zeros_like(test_batch.batch["response_mask"], dtype=torch.float32)
@@ -741,18 +739,8 @@ class RayPPOTrainer:
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
-        if merged:
-            print("_merge_validation_results validate result will be merged")
-            return {
-                "data_sources": data_source_lst,
-                "sample_uids": sample_uids,
-                "sample_turns": sample_turns,
-                "reward_extra_infos_dict": reward_extra_infos_dict,
-            }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -778,30 +766,6 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
-
-    def _merge_validation_results(self, result_a, result_b):
-        if result_a is None and result_b is None:
-            return {}
-        if result_a is None:
-            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
-        if result_b is None:
-            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
-
-        if not result_a.get("data_sources") and not result_b.get("data_sources"):
-            return {}
-
-        data_sources = np.concatenate(result_a["data_sources"] + result_b["data_sources"], axis=0)
-        sample_uids = result_a["sample_uids"] + result_b["sample_uids"]
-        sample_turns = result_a["sample_turns"] + result_b["sample_turns"]
-
-        reward_extra_infos_dict = {}
-        all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
-        for key in all_keys:
-            list_a = result_a["reward_extra_infos_dict"].get(key, [])
-            list_b = result_b["reward_extra_infos_dict"].get(key, [])
-            reward_extra_infos_dict[key] = list_a + list_b
-
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1159,11 +1123,7 @@ class RayPPOTrainer:
         return max(dp_rank_mapping) + 1
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens.
-
-        When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
-        the same uid together on the same rank for prefix sharing optimization.
-        """
+        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
@@ -1171,33 +1131,7 @@ class RayPPOTrainer:
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-
-        # Use group-level balancing for PrefixGrouper to keep same-uid samples together
-        if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
-            from verl.utils.seqlen_balancing import get_group_balanced_partitions
-
-            uid_list = list(batch.non_tensor_batch["uid"])
-            seqlen_list = global_seqlen_lst.tolist()
-
-            # Count number of uid groups
-            num_groups = len(set(uid_list))
-
-            if num_groups % dp_size != 0:
-                raise ValueError(
-                    f"PrefixGrouper with balance_batch requires num_uid_groups ({num_groups}) "
-                    f"% dp_size ({dp_size}) == 0. "
-                    f"This ensures each rank gets equal number of groups. "
-                    f"Current batch_size={batch_size}, adjust batch_size to be a multiple of "
-                    f"dp_size * rollout.n."
-                )
-
-            global_partition_lst = get_group_balanced_partitions(
-                seqlen_list=seqlen_list,
-                uid_list=uid_list,
-                k_partitions=dp_size,
-            )
-
-        elif keep_minibatch:
+        if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
             minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
             minibatch_num = len(workload_lst) // minibatch_size
@@ -1213,18 +1147,15 @@ class RayPPOTrainer:
         else:
             global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
         # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
-        # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
-        if not getattr(self, "use_prefix_grouper", False):
-            for idx, partition in enumerate(global_partition_lst):
-                partition.sort(key=lambda x: (workload_lst[x], x))
-                ordered_partition = partition[::2] + partition[1::2][::-1]
-                global_partition_lst[idx] = ordered_partition
-
+        for idx, partition in enumerate(global_partition_lst):
+            partition.sort(key=lambda x: (workload_lst[x], x))
+            ordered_partition = partition[::2] + partition[1::2][::-1]
+            global_partition_lst[idx] = ordered_partition
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(
-            seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
+            seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
 
@@ -1587,20 +1518,13 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    # get images_seqlens
-                    images_seqlens_all = []
-                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
-                        if "image_grid_thw" not in multi_modal_input.keys():
-                            continue
-                        images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
-                    batch.meta_info["images_seqlens"] = images_seqlens_all
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # GAD mode: use critic values as reward instead of reward function
                         # GAD (Generative Adversarial Distillation) uses the critic/discriminator
                         # to compute rewards based on student vs teacher responses
-                        is_gad_mode = "teacher_input_ids" in batch.batch
                         
-                        if is_gad_mode:
+                        if self.is_gad_mode:
                             # GAD mode: compute critic values as reward
                             # NOTE: we use critic to calculate score of student here
                             reward_extra_infos_dict = {}
@@ -1685,7 +1609,7 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         # In GAD mode, reward_tensor is already computed from critic values
                         # In standard mode with async reward, wait for the result
-                        if not is_gad_mode and self.config.reward_model.launch_reward_fn_async:
+                        if not self.is_gad_mode and self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
@@ -1813,9 +1737,6 @@ class RayPPOTrainer:
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # compute variance proxy metrics
-                gradient_norm = metrics.get("actor/grad_norm", None)
-                metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
