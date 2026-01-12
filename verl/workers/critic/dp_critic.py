@@ -215,6 +215,12 @@ class DataParallelPPOCritic(BasePPOCritic):
         # Check if we are in GAD discriminator mode
         is_gad_mode = "teacher_input_ids" in data.batch
         
+        # Log GAD mode detection (only once per update call)
+        print(f"[dp_critic] GAD mode: {is_gad_mode}, batch keys: {list(data.batch.keys())}")
+        if is_gad_mode:
+            print(f"[dp_critic] teacher_input_ids shape: {data.batch['teacher_input_ids'].shape}")
+            print(f"[dp_critic] teacher_response shape: {data.batch['teacher_response'].shape}")
+        
         if is_gad_mode:
             # GAD discriminator mode
             metrics = {

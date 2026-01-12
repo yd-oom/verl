@@ -600,9 +600,10 @@ class RayPPOTrainer:
             return reward_tensor, reward_extra_infos_dict
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "teacher_response"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
+        # GAD: teacher_response is kept as string in non_tensor_batch for AgentLoop compatibility
         batch_keys_to_pop = []
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
@@ -1383,90 +1384,6 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                        
-                        # GAD: Process teacher_response if present
-                        if "teacher_response" in batch.non_tensor_batch:
-                            teacher_responses = batch.non_tensor_batch["teacher_response"]
-                            # Tokenize teacher responses
-                            teacher_response_ids_list = []
-                            teacher_response_masks_list = []
-                            max_teacher_response_length = self.config.actor_rollout_ref.rollout.response_length
-                            
-                            for teacher_resp in teacher_responses:
-                                if teacher_resp is not None and isinstance(teacher_resp, str):
-                                    # Tokenize teacher response
-                                    teacher_tokens = self.tokenizer(
-                                        teacher_resp, 
-                                        return_tensors="pt", 
-                                        add_special_tokens=False,
-                                        truncation=True,
-                                        max_length=max_teacher_response_length
-                                    )
-                                    teacher_ids = teacher_tokens["input_ids"][0]  # (seq_len,)
-                                    
-                                    # Pad or truncate to max_teacher_response_length (right padding)
-                                    if len(teacher_ids) < max_teacher_response_length:
-                                        pad_length = max_teacher_response_length - len(teacher_ids)
-                                        teacher_ids = torch.cat([
-                                            teacher_ids, 
-                                            torch.full((pad_length,), self.tokenizer.eos_token_id, dtype=teacher_ids.dtype)
-                                        ])
-                                    else:
-                                        teacher_ids = teacher_ids[:max_teacher_response_length]
-                                    
-                                    # Create mask (1 for valid tokens, 0 for padding)
-                                    teacher_mask = (teacher_ids != self.tokenizer.eos_token_id).long()
-                                    # Set at least one token to be valid (the first one) to avoid empty sequences
-                                    if teacher_mask.sum() == 0:
-                                        teacher_mask[0] = 1
-                                    
-                                    teacher_response_ids_list.append(teacher_ids)
-                                    teacher_response_masks_list.append(teacher_mask)
-                                else:
-                                    # No teacher response for this sample, create dummy data
-                                    teacher_response_ids_list.append(
-                                        torch.full((max_teacher_response_length,), self.tokenizer.eos_token_id, dtype=torch.long)
-                                    )
-                                    teacher_response_masks_list.append(
-                                        torch.zeros(max_teacher_response_length, dtype=torch.long)
-                                    )
-                            
-                            # Stack into tensors
-                            teacher_response_ids = torch.stack(teacher_response_ids_list)  # (batch_size, max_teacher_response_length)
-                            teacher_response_masks = torch.stack(teacher_response_masks_list)  # (batch_size, max_teacher_response_length)
-                            
-                            # Construct teacher input_ids by concatenating prompts with teacher responses
-                            # Get prompt ids from batch (before responses were generated)
-                            prompt_ids = batch.batch["input_ids"]  # (batch_size, prompt_length)
-                            prompt_attention_mask = batch.batch["attention_mask"]  # (batch_size, prompt_length)
-                            prompt_position_ids = batch.batch["position_ids"]  # (batch_size, prompt_length) or (batch_size, 3, prompt_length)
-                            
-                            # Concatenate prompt and teacher response
-                            teacher_input_ids = torch.cat([prompt_ids, teacher_response_ids], dim=-1)  # (batch_size, prompt_length + max_teacher_response_length)
-                            teacher_attention_mask = torch.cat([prompt_attention_mask, teacher_response_masks], dim=-1)
-                            
-                            # Compute teacher position_ids
-                            batch_size = teacher_response_ids.size(0)
-                            teacher_response_length = teacher_response_ids.size(1)
-                            
-                            if prompt_position_ids.dim() == 3:  # qwen2vl mrope: (batch_size, 3, prompt_length)
-                                # For multimodal models with mrope
-                                last_prompt_pos = prompt_position_ids[:, :, -1:]  # (batch_size, 3, 1)
-                                teacher_delta_position_ids = torch.arange(1, teacher_response_length + 1, device=prompt_position_ids.device)
-                                teacher_delta_position_ids = teacher_delta_position_ids.unsqueeze(0).unsqueeze(0).expand(batch_size, 3, -1)  # (batch_size, 3, teacher_response_length)
-                                teacher_position_ids = torch.cat([prompt_position_ids, last_prompt_pos + teacher_delta_position_ids], dim=-1)
-                            else:  # Standard case: (batch_size, prompt_length)
-                                last_prompt_pos = prompt_position_ids[:, -1:]  # (batch_size, 1)
-                                teacher_delta_position_ids = torch.arange(1, teacher_response_length + 1, device=prompt_position_ids.device)
-                                teacher_delta_position_ids = teacher_delta_position_ids.unsqueeze(0).expand(batch_size, -1)  # (batch_size, teacher_response_length)
-                                teacher_position_ids = torch.cat([prompt_position_ids, last_prompt_pos + teacher_delta_position_ids], dim=-1)
-                            
-                            # Add teacher data to batch
-                            batch.batch["teacher_response"] = teacher_response_ids
-                            batch.batch["teacher_response_mask"] = teacher_response_masks
-                            batch.batch["teacher_input_ids"] = teacher_input_ids
-                            batch.batch["teacher_attention_mask"] = teacher_attention_mask
-                            batch.batch["teacher_position_ids"] = teacher_position_ids
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1506,6 +1423,108 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # GAD: Process teacher_response (string in non_tensor_batch, needs tokenization)
+                    # NOTE: Process after repeat and union so batch sizes match
+                    if "teacher_response" in batch.non_tensor_batch:
+                        teacher_responses = batch.non_tensor_batch["teacher_response"]
+                        print(f"[ray_trainer] GAD: Found teacher_response in non_tensor_batch, count: {len(teacher_responses)}")
+                        
+                        # Tokenize teacher responses
+                        batch_size = len(teacher_responses)
+                        max_teacher_response_length = self.config.actor_rollout_ref.rollout.response_length
+                        teacher_response_ids_list = []
+                        teacher_response_masks_list = []
+                        
+                        for teacher_resp in teacher_responses:
+                            if teacher_resp is not None and isinstance(teacher_resp, str):
+                                # Tokenize teacher response
+                                teacher_tokens = self.tokenizer(
+                                    teacher_resp, 
+                                    return_tensors="pt", 
+                                    add_special_tokens=False,
+                                    truncation=True,
+                                    max_length=max_teacher_response_length
+                                )
+                                teacher_ids = teacher_tokens["input_ids"][0]  # (seq_len,)
+                                
+                                # Pad or truncate to max_teacher_response_length (right padding)
+                                if len(teacher_ids) < max_teacher_response_length:
+                                    pad_length = max_teacher_response_length - len(teacher_ids)
+                                    teacher_ids = torch.cat([
+                                        teacher_ids, 
+                                        torch.full((pad_length,), self.tokenizer.eos_token_id, dtype=teacher_ids.dtype)
+                                    ])
+                                else:
+                                    teacher_ids = teacher_ids[:max_teacher_response_length]
+                                
+                                # Create mask (1 for valid tokens, 0 for padding)
+                                teacher_mask = (teacher_ids != self.tokenizer.eos_token_id).long()
+                                if teacher_mask.sum() == 0:
+                                    teacher_mask[0] = 1
+                                
+                                teacher_response_ids_list.append(teacher_ids)
+                                teacher_response_masks_list.append(teacher_mask)
+                            else:
+                                # No teacher response, create dummy
+                                teacher_response_ids_list.append(
+                                    torch.full((max_teacher_response_length,), self.tokenizer.eos_token_id, dtype=torch.long)
+                                )
+                                teacher_response_masks_list.append(
+                                    torch.zeros(max_teacher_response_length, dtype=torch.long)
+                                )
+                        
+                        # Stack into tensors
+                        teacher_response_ids = torch.stack(teacher_response_ids_list)  # (batch_size, max_response_length)
+                        teacher_response_masks = torch.stack(teacher_response_masks_list)
+                        
+                        teacher_response_length = teacher_response_ids.size(1)
+                        
+                        # Use prompt from batch
+                        prompt_ids = batch.batch["prompts"]  # (batch_size, prompt_length)
+                        prompt_attention_mask = batch.batch["attention_mask"]  # (batch_size, total_length)
+                        prompt_position_ids = batch.batch["position_ids"]  # (batch_size, total_length) or (batch_size, 3, total_length)
+                        
+                        # Move teacher_response to same device as prompt
+                        teacher_response_ids = teacher_response_ids.to(prompt_ids.device)
+                        teacher_response_masks = teacher_response_masks.to(prompt_attention_mask.device)
+                        
+                        # For teacher, we need prompt + teacher_response (not generated response)
+                        # Get prompt length from prompts tensor
+                        prompt_length = prompt_ids.size(1)
+                        
+                        # Slice prompt-only parts from full sequence tensors
+                        prompt_only_attention_mask = prompt_attention_mask[:, :prompt_length]
+                        if prompt_position_ids.dim() == 3:  # mrope
+                            prompt_only_position_ids = prompt_position_ids[:, :, :prompt_length]
+                        else:
+                            prompt_only_position_ids = prompt_position_ids[:, :prompt_length]
+                        
+                        # Concatenate prompt and teacher response
+                        teacher_input_ids = torch.cat([prompt_ids, teacher_response_ids], dim=-1)
+                        teacher_attention_mask = torch.cat([prompt_only_attention_mask, teacher_response_masks], dim=-1)
+                        
+                        # Compute teacher position_ids
+                        if prompt_only_position_ids.dim() == 3:  # mrope: (batch_size, num_heads, prompt_length)
+                            num_heads = prompt_only_position_ids.size(1)  # could be 3 (qwen2vl) or 4 (qwen3vl)
+                            last_prompt_pos = prompt_only_position_ids[:, :, -1:]  # (batch_size, num_heads, 1)
+                            teacher_delta_position_ids = torch.arange(1, teacher_response_length + 1, device=prompt_only_position_ids.device)
+                            teacher_delta_position_ids = teacher_delta_position_ids.unsqueeze(0).unsqueeze(0).expand(batch_size, num_heads, -1)
+                            teacher_position_ids = torch.cat([prompt_only_position_ids, last_prompt_pos + teacher_delta_position_ids], dim=-1)
+                        else:  # Standard case: (batch_size, prompt_length)
+                            last_prompt_pos = prompt_only_position_ids[:, -1:]  # (batch_size, 1)
+                            teacher_delta_position_ids = torch.arange(1, teacher_response_length + 1, device=prompt_only_position_ids.device)
+                            teacher_delta_position_ids = teacher_delta_position_ids.unsqueeze(0).expand(batch_size, -1)
+                            teacher_position_ids = torch.cat([prompt_only_position_ids, last_prompt_pos + teacher_delta_position_ids], dim=-1)
+                        
+                        # Update batch with teacher data (will be passed to critic)
+                        batch.batch["teacher_response"] = teacher_response_ids
+                        batch.batch["teacher_response_mask"] = teacher_response_masks
+                        batch.batch["teacher_input_ids"] = teacher_input_ids
+                        batch.batch["teacher_attention_mask"] = teacher_attention_mask
+                        batch.batch["teacher_position_ids"] = teacher_position_ids
+                        print(f"[ray_trainer] GAD: teacher_input_ids constructed, shape: {teacher_input_ids.shape}")
+                        print(f"[ray_trainer] GAD: prompts shape: {prompt_ids.shape}, teacher_response shape: {teacher_response_ids.shape}")
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)

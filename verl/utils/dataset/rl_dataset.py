@@ -32,6 +32,7 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl.utils.import_utils import load_extern_object
+import verl.utils.torch_functional as verl_F
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,7 @@ class RLHFDataset(Dataset):
         self.video_key = config.get("video_key", "videos")
         self.image_patch_size = config.get("image_patch_size", 14)
         self.max_prompt_length = config.get("max_prompt_length", 1024)
+        self.max_response_length = config.get("max_response_length", 512)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
@@ -318,6 +320,7 @@ class RLHFDataset(Dataset):
                     if isinstance(image, Image.Image):
                         image = image.convert("RGB")
                     elif isinstance(image, dict) and "bytes" in image:
+                        # Convert bytes to PIL Image, don't pass the whole dict
                         image = Image.open(BytesIO(image["bytes"])).convert("RGB")
                     content_list.append({"type": "image", "image": image})
                     image_offset += 1
@@ -342,13 +345,16 @@ class RLHFDataset(Dataset):
         # Remove this after deprecate DataProto by TensorDict.
         row_dict["dummy_tensor"] = torch.tensor([0], dtype=torch.uint8)
 
-        # GAD: Extract teacher_response if present
-        # Teacher response will be tokenized in AgentLoop like other text fields
-        # Keep it as string here for now, will be processed later in the pipeline
-        teacher_response = row_dict.get("teacher_response", None)
-        if teacher_response is not None:
-            # Store as string, will be tokenized later in rollout worker
-            row_dict["teacher_response"] = teacher_response
+        # GAD: Keep teacher_response as string in non_tensor_batch for AgentLoop compatibility
+        # AgentLoop only processes non_tensor_batch, so we cannot tokenize here
+        # Tokenization will happen in ray_trainer.py after AgentLoop returns
+        teacher_response_str = row_dict.get("teacher_response", None)
+        if teacher_response_str is not None and isinstance(teacher_response_str, str):
+            # Keep as string, will be tokenized later in ray_trainer
+            row_dict["teacher_response"] = teacher_response_str
+            # Log only for first item to avoid spam
+            if item == 0:
+                print(f"[rl_dataset] GAD: found teacher_response (string), len: {len(teacher_response_str)}")
 
         # add index for each prompt
         if "extra_info" not in row_dict or row_dict["extra_info"] is None:
