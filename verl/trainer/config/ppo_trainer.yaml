@@ -185,6 +185,9 @@ trainer:
 
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0
+  
+  # GAD adversarial training: n_actor_updates_per_critic
+  n_actor_updates_per_critic: 1
 
   # Default path to distributed filesystem for saving checkpoints
   default_hdfs_dir: null

@@ -1674,12 +1674,22 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
-                    # update critic
-                    if self.use_critic:
+                    # update critic (with optional frequency control for GAD)
+                    # If n_actor_updates_per_critic > 1, critic updates less frequently
+                    n_actor_per_critic = getattr(self.config.trainer, 'n_actor_updates_per_critic', 1)
+                    should_update_critic = (self.global_steps % n_actor_per_critic == 0)
+                    
+                    if self.use_critic and should_update_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
+                    elif self.use_critic and not should_update_critic:
+                        # Skip critic update this step, log it
+                        metrics.update({
+                            "critic/skipped": 1.0,
+                            "critic/update_ratio": f"1:{n_actor_per_critic}"
+                        })
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:

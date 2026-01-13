@@ -592,6 +592,7 @@ trainer:
   val_only: false
   test_freq: -1
   critic_warmup: 0
+  n_actor_updates_per_critic: 1
   default_hdfs_dir: null
   del_local_ckpt_after_load: false
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
